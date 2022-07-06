@@ -64,7 +64,7 @@ CPUMonitorBase::CPUMonitorBase(const std::string & node_name, const rclcpp::Node
   updater_.add("CPU Temperature", this, &CPUMonitorBase::checkTemp);
   updater_.add("CPU Usage", this, &CPUMonitorBase::checkUsage);
   updater_.add("CPU Load Average", this, &CPUMonitorBase::checkLoad);
-  updater_.add("CPU Thermal Throttling", this, &CPUMonitorBase::checkThrottling);
+  //updater_.add("CPU Thermal Throttling", this, &CPUMonitorBase::checkThrottling);
   updater_.add("CPU Frequency", this, &CPUMonitorBase::checkFrequency);
 
   // Publisher

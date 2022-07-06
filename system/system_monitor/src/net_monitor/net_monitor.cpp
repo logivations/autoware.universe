@@ -59,7 +59,7 @@ NetMonitor::NetMonitor(const rclcpp::NodeOptions & options)
   gethostname(hostname_, sizeof(hostname_));
   updater_.setHardwareID(hostname_);
   updater_.add("Network Usage", this, &NetMonitor::checkUsage);
-  updater_.add("Network Traffic", this, &NetMonitor::monitorTraffic);
+  //updater_.add("Network Traffic", this, &NetMonitor::monitorTraffic);
 
   nl80211_.init();
 }
