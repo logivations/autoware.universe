@@ -70,9 +70,9 @@ NetMonitor::NetMonitor(const rclcpp::NodeOptions & options)
   gethostname(hostname_, sizeof(hostname_));
   updater_.setHardwareID(hostname_);
   updater_.add("Network Usage", this, &NetMonitor::checkUsage);
-  updater_.add("Network Traffic", this, &NetMonitor::monitorTraffic);
-  updater_.add("Network CRC Error", this, &NetMonitor::checkCrcError);
-  updater_.add("IP Packet Reassembles Failed", this, &NetMonitor::checkReassemblesFailed);
+  // updater_.add("Network Traffic", this, &NetMonitor::monitorTraffic);
+  // updater_.add("Network CRC Error", this, &NetMonitor::checkCrcError);
+  // updater_.add("IP Packet Reassembles Failed", this, &NetMonitor::checkReassemblesFailed);
 
   nl80211_.init();
 

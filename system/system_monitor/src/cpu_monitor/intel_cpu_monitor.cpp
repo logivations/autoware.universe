@@ -155,7 +155,7 @@ void CPUMonitor::checkThrottling(diagnostic_updater::DiagnosticStatusWrapper & s
 
 void CPUMonitor::getTempNames()
 {
-  const fs::path root("/sys/devices/platform/coretemp.0");
+  const fs::path root("/sys/devices");
 
   if (!fs::exists(root)) {
     return;
