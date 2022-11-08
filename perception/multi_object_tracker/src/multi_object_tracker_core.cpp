@@ -30,6 +30,7 @@
 #define EIGEN_MPL2_ONLY
 #include "multi_object_tracker/multi_object_tracker_core.hpp"
 #include "multi_object_tracker/utils/utils.hpp"
+#include "perception_utils/perception_utils.hpp"
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -39,7 +40,7 @@ using Label = autoware_auto_perception_msgs::msg::ObjectClassification;
 
 namespace
 {
-boost::optional<geometry_msgs::msg::Transform> getTransform(
+boost::optional<geometry_msgs::msg::Transform> getTransformAnonymous(
   const tf2_ros::Buffer & tf_buffer, const std::string & source_frame_id,
   const std::string & target_frame_id, const rclcpp::Time & time)
 {
@@ -53,107 +54,6 @@ boost::optional<geometry_msgs::msg::Transform> getTransform(
     RCLCPP_WARN_STREAM(rclcpp::get_logger("multi_object_tracker"), ex.what());
     return boost::none;
   }
-}
-
-bool transformDetectedObjects(
-  const autoware_auto_perception_msgs::msg::DetectedObjects & input_msg,
-  const std::string & target_frame_id, const tf2_ros::Buffer & tf_buffer,
-  autoware_auto_perception_msgs::msg::DetectedObjects & output_msg)
-{
-  output_msg = input_msg;
-
-  /* transform to world coordinate */
-  if (input_msg.header.frame_id != target_frame_id) {
-    output_msg.header.frame_id = target_frame_id;
-    tf2::Transform tf_target2objects_world;
-    tf2::Transform tf_target2objects;
-    tf2::Transform tf_objects_world2objects;
-    {
-      const auto ros_target2objects_world =
-        getTransform(tf_buffer, input_msg.header.frame_id, target_frame_id, input_msg.header.stamp);
-      if (!ros_target2objects_world) {
-        return false;
-      }
-      tf2::fromMsg(*ros_target2objects_world, tf_target2objects_world);
-    }
-    for (auto & object : output_msg.objects) {
-      tf2::fromMsg(object.kinematics.pose_with_covariance.pose, tf_objects_world2objects);
-      tf_target2objects = tf_target2objects_world * tf_objects_world2objects;
-      tf2::toMsg(tf_target2objects, object.kinematics.pose_with_covariance.pose);
-      // TODO(yukkysaito) transform covariance
-    }
-  }
-  return true;
-}
-
-inline float getVelocity(const autoware_auto_perception_msgs::msg::TrackedObject & object)
-{
-  return std::hypot(
-    object.kinematics.twist_with_covariance.twist.linear.x,
-    object.kinematics.twist_with_covariance.twist.linear.y);
-}
-
-inline geometry_msgs::msg::Pose getPose(
-  const autoware_auto_perception_msgs::msg::TrackedObject & object)
-{
-  return object.kinematics.pose_with_covariance.pose;
-}
-
-float getXYSquareDistance(
-  const geometry_msgs::msg::Transform & self_transform,
-  const autoware_auto_perception_msgs::msg::TrackedObject & object)
-{
-  const auto object_pos = getPose(object).position;
-  const float x = self_transform.translation.x - object_pos.x;
-  const float y = self_transform.translation.y - object_pos.y;
-  return x * x + y * y;
-}
-
-/**
- * @brief If the tracker is stable at a low speed and has a vehicle type, it will keep
- * tracking for a longer time to deal with detection lost due to occlusion, etc.
- * @param tracker The tracker to be determined.
- * @param time Target time to determine.
- * @param self_transform Position of the vehicle at the target time.
- * @return Result of deciding whether to leave tracker or not.
- */
-bool isSpecificAlivePattern(
-  const std::shared_ptr<const Tracker> & tracker, const rclcpp::Time & time,
-  const geometry_msgs::msg::Transform & self_transform)
-{
-  autoware_auto_perception_msgs::msg::TrackedObject object;
-  tracker->getTrackedObject(time, object);
-
-  constexpr float min_detection_rate = 0.2;
-  constexpr int min_measurement_count = 5;
-  constexpr float max_elapsed_time = 10.0;
-  constexpr float max_velocity = 1.0;
-  constexpr float max_distance = 100.0;
-
-  const std::uint8_t label = tracker->getHighestProbLabel();
-
-  const float detection_rate =
-    tracker->getTotalMeasurementCount() /
-    (tracker->getTotalNoMeasurementCount() + tracker->getTotalMeasurementCount());
-
-  const bool big_vehicle = (label == Label::TRUCK || label == Label::BUS);
-
-  const bool slow_velocity = getVelocity(object) < max_velocity;
-
-  const bool high_confidence =
-    (min_detection_rate < detection_rate ||
-     min_measurement_count < tracker->getTotalMeasurementCount());
-
-  const bool not_too_far =
-    getXYSquareDistance(self_transform, object) < max_distance * max_distance;
-
-  const bool within_max_survival_period =
-    tracker->getElapsedTimeFromLastUpdate(time) < max_elapsed_time;
-
-  const bool is_specific_alive_pattern =
-    high_confidence && big_vehicle && within_max_survival_period && not_too_far && slow_velocity;
-
-  return is_specific_alive_pattern;
 }
 
 }  // namespace
@@ -203,6 +103,8 @@ MultiObjectTracker::MultiObjectTracker(const rclcpp::NodeOptions & node_options)
   tracker_map_.insert(
     std::make_pair(Label::BUS, this->declare_parameter<std::string>("bus_tracker")));
   tracker_map_.insert(
+    std::make_pair(Label::TRAILER, this->declare_parameter<std::string>("trailer_tracker")));
+  tracker_map_.insert(
     std::make_pair(Label::PEDESTRIAN, this->declare_parameter<std::string>("pedestrian_tracker")));
   tracker_map_.insert(
     std::make_pair(Label::BICYCLE, this->declare_parameter<std::string>("bicycle_tracker")));
@@ -217,15 +119,15 @@ MultiObjectTracker::MultiObjectTracker(const rclcpp::NodeOptions & node_options)
 void MultiObjectTracker::onMeasurement(
   const autoware_auto_perception_msgs::msg::DetectedObjects::ConstSharedPtr input_objects_msg)
 {
-  const auto self_transform =
-    getTransform(tf_buffer_, "base_link", world_frame_id_, input_objects_msg->header.stamp);
+  const auto self_transform = getTransformAnonymous(
+    tf_buffer_, "base_link", world_frame_id_, input_objects_msg->header.stamp);
   if (!self_transform) {
     return;
   }
 
   /* transform to world coordinate */
   autoware_auto_perception_msgs::msg::DetectedObjects transformed_objects;
-  if (!transformDetectedObjects(
+  if (!perception_utils::transformObjects(
         *input_objects_msg, world_frame_id_, tf_buffer_, transformed_objects)) {
     return;
   }
@@ -279,7 +181,7 @@ std::shared_ptr<Tracker> MultiObjectTracker::createNewTracker(
   const autoware_auto_perception_msgs::msg::DetectedObject & object,
   const rclcpp::Time & time) const
 {
-  const std::uint8_t label = utils::getHighestProbLabel(object.classification);
+  const std::uint8_t label = perception_utils::getHighestProbLabel(object.classification);
   if (tracker_map_.count(label) != 0) {
     const auto tracker = tracker_map_.at(label);
 
@@ -305,7 +207,8 @@ std::shared_ptr<Tracker> MultiObjectTracker::createNewTracker(
 void MultiObjectTracker::onTimer()
 {
   rclcpp::Time current_time = this->now();
-  const auto self_transform = getTransform(tf_buffer_, world_frame_id_, "base_link", current_time);
+  const auto self_transform =
+    getTransformAnonymous(tf_buffer_, world_frame_id_, "base_link", current_time);
   if (!self_transform) {
     return;
   }
@@ -321,7 +224,7 @@ void MultiObjectTracker::onTimer()
 
 void MultiObjectTracker::checkTrackerLifeCycle(
   std::list<std::shared_ptr<Tracker>> & list_tracker, const rclcpp::Time & time,
-  const geometry_msgs::msg::Transform & self_transform)
+  [[maybe_unused]] const geometry_msgs::msg::Transform & self_transform)
 {
   /* params */
   constexpr float max_elapsed_time = 1.0;
@@ -329,8 +232,7 @@ void MultiObjectTracker::checkTrackerLifeCycle(
   /* delete tracker */
   for (auto itr = list_tracker.begin(); itr != list_tracker.end(); ++itr) {
     const bool is_old = max_elapsed_time < (*itr)->getElapsedTimeFromLastUpdate(time);
-    const bool is_specific_alive_pattern = isSpecificAlivePattern(*itr, time, self_transform);
-    if (is_old && !is_specific_alive_pattern) {
+    if (is_old) {
       auto erase_itr = itr;
       --itr;
       list_tracker.erase(erase_itr);
@@ -360,7 +262,7 @@ void MultiObjectTracker::sanitizeTracker(
         continue;
       }
 
-      const auto iou = utils::get2dIoU(object1, object2);
+      const auto iou = perception_utils::get2dIoU(object1, object2);
       const auto & label1 = (*itr1)->getHighestProbLabel();
       const auto & label2 = (*itr2)->getHighestProbLabel();
       bool should_delete_tracker1 = false;

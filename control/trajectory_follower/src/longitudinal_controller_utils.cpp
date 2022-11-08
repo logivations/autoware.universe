@@ -14,7 +14,6 @@
 
 #include "trajectory_follower/longitudinal_controller_utils.hpp"
 
-#include "motion_common/motion_common.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 
@@ -66,27 +65,19 @@ float64_t calcStopDistance(
   const Pose & current_pose, const Trajectory & traj, const float64_t max_dist,
   const float64_t max_yaw)
 {
-  const std::experimental::optional<size_t> stop_idx_opt =
-    trajectory_common::searchZeroVelocityIndex(traj.points);
+  const auto stop_idx_opt = motion_utils::searchZeroVelocityIndex(traj.points);
 
-  auto seg_idx =
-    tier4_autoware_utils::findNearestSegmentIndex(traj.points, current_pose, max_dist, max_yaw);
-  if (!seg_idx) {  // if not fund idx
-    seg_idx = tier4_autoware_utils::findNearestSegmentIndex(traj.points, current_pose);
+  const size_t end_idx = stop_idx_opt ? *stop_idx_opt : traj.points.size() - 1;
+  const size_t seg_idx = motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+    traj.points, current_pose, max_dist, max_yaw);
+  const float64_t signed_length_on_traj = motion_utils::calcSignedArcLength(
+    traj.points, current_pose.position, seg_idx, traj.points.at(end_idx).pose.position,
+    std::min(end_idx, traj.points.size() - 2));
+
+  if (std::isnan(signed_length_on_traj)) {
+    return 0.0;
   }
-  const float64_t signed_length_src_offset = tier4_autoware_utils::calcLongitudinalOffsetToSegment(
-    traj.points, *seg_idx, current_pose.position);
-
-  // If no zero velocity point, return the length between current_pose to the end of trajectory.
-  if (!stop_idx_opt) {
-    float64_t signed_length_on_traj =
-      tier4_autoware_utils::calcSignedArcLength(traj.points, *seg_idx, traj.points.size() - 1);
-    return signed_length_on_traj - signed_length_src_offset;
-  }
-
-  float64_t signed_length_on_traj =
-    tier4_autoware_utils::calcSignedArcLength(traj.points, *seg_idx, *stop_idx_opt);
-  return signed_length_on_traj - signed_length_src_offset;
+  return signed_length_on_traj;
 }
 
 float64_t getPitchByPose(const Quaternion & quaternion_msg)
@@ -149,7 +140,7 @@ Pose calcPoseAfterTimeDelay(
   const Pose & current_pose, const float64_t delay_time, const float64_t current_vel)
 {
   // simple linear prediction
-  const float64_t yaw = ::motion::motion_common::to_angle(current_pose.orientation);
+  const float64_t yaw = tf2::getYaw(current_pose.orientation);
   const float64_t running_distance = delay_time * current_vel;
   const float64_t dx = running_distance * std::cos(yaw);
   const float64_t dy = running_distance * std::sin(yaw);

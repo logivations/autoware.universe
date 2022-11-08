@@ -15,44 +15,14 @@
 #ifndef FREESPACE_PLANNING_ALGORITHMS__ABSTRACT_ALGORITHM_HPP_
 #define FREESPACE_PLANNING_ALGORITHMS__ABSTRACT_ALGORITHM_HPP_
 
+#include <tier4_autoware_utils/geometry/geometry.hpp>
+
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 
 #include <tf2/utils.h>
 
-#ifdef ROS_DISTRO_GALACTIC
-#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
-#else
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-#endif
-
 #include <vector>
-
-#ifdef ROS_DISTRO_GALACTIC
-namespace tf2
-{
-inline void fromMsg(const geometry_msgs::msg::Point & in, tf2::Vector3 & out)
-{
-  out = tf2::Vector3(in.x, in.y, in.z);
-}
-
-template <>
-inline void doTransform(
-  const geometry_msgs::msg::Pose & t_in, geometry_msgs::msg::Pose & t_out,
-  const geometry_msgs::msg::TransformStamped & transform)
-{
-  tf2::Vector3 v;
-  fromMsg(t_in.position, v);
-  tf2::Quaternion r;
-  fromMsg(t_in.orientation, r);
-
-  tf2::Transform t;
-  fromMsg(transform.transform, t);
-  tf2::Transform v_out = t * tf2::Transform(r, v);
-  toMsg(v_out, t_out);
-}
-}  // namespace tf2
-#endif
 
 namespace freespace_planning_algorithms
 {
@@ -97,7 +67,6 @@ struct PlannerCommonParam
   double time_limit;  // planning time limit [msec]
 
   // robot configs
-  VehicleShape vehicle_shape;
   double minimum_turning_radius;  // [m]
   double maximum_turning_radius;  // [m]
   int turning_radius_size;        // discretized turning radius table size [-]
@@ -124,31 +93,30 @@ struct PlannerWaypoints
 {
   std_msgs::msg::Header header;
   std::vector<PlannerWaypoint> waypoints;
+
+  double compute_length() const;
 };
 
 class AbstractPlanningAlgorithm
 {
 public:
-  explicit AbstractPlanningAlgorithm(const PlannerCommonParam & planner_common_param)
-  : planner_common_param_(planner_common_param)
+  AbstractPlanningAlgorithm(
+    const PlannerCommonParam & planner_common_param, const VehicleShape & collision_vehicle_shape)
+  : planner_common_param_(planner_common_param), collision_vehicle_shape_(collision_vehicle_shape)
   {
   }
+
   virtual void setMap(const nav_msgs::msg::OccupancyGrid & costmap);
   virtual bool makePlan(
     const geometry_msgs::msg::Pose & start_pose, const geometry_msgs::msg::Pose & goal_pose) = 0;
-  virtual bool hasFeasibleSolution() = 0;  // currently used only in testing
-  void setVehicleShape(const VehicleShape & vehicle_shape)
-  {
-    planner_common_param_.vehicle_shape = vehicle_shape;
-  }
-  bool hasObstacleOnTrajectory(const geometry_msgs::msg::PoseArray & trajectory);
+  virtual bool hasObstacleOnTrajectory(const geometry_msgs::msg::PoseArray & trajectory) const;
   const PlannerWaypoints & getWaypoints() const { return waypoints_; }
   virtual ~AbstractPlanningAlgorithm() {}
 
 protected:
-  void computeCollisionIndexes(int theta_index, std::vector<IndexXY> & indexes);
-  bool detectCollision(const IndexXYT & base_index);
-  inline bool isOutOfRange(const IndexXYT & index)
+  void computeCollisionIndexes(int theta_index, std::vector<IndexXY> & indexes) const;
+  bool detectCollision(const IndexXYT & base_index) const;
+  inline bool isOutOfRange(const IndexXYT & index) const
   {
     if (index.x < 0 || static_cast<int>(costmap_.info.width) <= index.x) {
       return true;
@@ -158,7 +126,7 @@ protected:
     }
     return false;
   }
-  inline bool isObs(const IndexXYT & index)
+  inline bool isObs(const IndexXYT & index) const
   {
     // NOTE: Accessing by .at() instead makes 1.2 times slower here.
     // Also, boundary check is already done in isOutOfRange before calling this function.
@@ -167,6 +135,7 @@ protected:
   }
 
   PlannerCommonParam planner_common_param_;
+  const VehicleShape collision_vehicle_shape_;
 
   // costmap as occupancy grid
   nav_msgs::msg::OccupancyGrid costmap_;

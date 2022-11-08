@@ -14,6 +14,8 @@
 
 #include "trajectory_follower/mpc.hpp"
 
+#include "motion_utils/motion_utils.hpp"
+
 #include <algorithm>
 #include <deque>
 #include <limits>
@@ -34,14 +36,13 @@ namespace control
 namespace trajectory_follower
 {
 using namespace std::literals::chrono_literals;
-using ::motion::motion_common::to_angle;
 
 bool8_t MPC::calculateMPC(
   const autoware_auto_vehicle_msgs::msg::SteeringReport & current_steer,
   const float64_t current_velocity, const geometry_msgs::msg::Pose & current_pose,
   autoware_auto_control_msgs::msg::AckermannLateralCommand & ctrl_cmd,
   autoware_auto_planning_msgs::msg::Trajectory & predicted_traj,
-  autoware_auto_system_msgs::msg::Float32MultiArrayDiagnostic & diagnostic)
+  tier4_debug_msgs::msg::Float32MultiArrayStamped & diagnostic)
 {
   /* recalculate velocity from ego-velocity with dynamics */
   trajectory_follower::MPCTrajectory reference_trajectory =
@@ -67,17 +68,20 @@ bool8_t MPC::calculateMPC(
   /* resample ref_traj with mpc sampling time */
   trajectory_follower::MPCTrajectory mpc_resampled_ref_traj;
   const float64_t mpc_start_time = mpc_data.nearest_time + m_param.input_delay;
-  if (!resampleMPCTrajectoryByTime(mpc_start_time, reference_trajectory, &mpc_resampled_ref_traj)) {
+  const float64_t prediction_dt =
+    getPredictionDeltaTime(mpc_start_time, reference_trajectory, current_pose);
+  if (!resampleMPCTrajectoryByTime(
+        mpc_start_time, prediction_dt, reference_trajectory, &mpc_resampled_ref_traj)) {
     RCLCPP_WARN_THROTTLE(m_logger, *m_clock, 1000 /*ms*/, "trajectory resampling failed.");
     return false;
   }
 
   /* generate mpc matrix : predict equation Xec = Aex * x0 + Bex * Uex + Wex */
-  MPCMatrix mpc_matrix = generateMPCMatrix(mpc_resampled_ref_traj);
+  MPCMatrix mpc_matrix = generateMPCMatrix(mpc_resampled_ref_traj, prediction_dt);
 
   /* solve quadratic optimization */
   Eigen::VectorXd Uex;
-  if (!executeOptimization(mpc_matrix, x0, &Uex)) {
+  if (!executeOptimization(mpc_matrix, x0, prediction_dt, &Uex)) {
     RCLCPP_WARN_THROTTLE(m_logger, *m_clock, 1000 /*ms*/, "optimization failed.");
     return false;
   }
@@ -88,9 +92,9 @@ bool8_t MPC::calculateMPC(
 
   /* set control command */
   {
-    const auto & dt = m_param.prediction_dt;
     ctrl_cmd.steering_tire_angle = static_cast<float>(u_filtered);
-    ctrl_cmd.steering_tire_rotation_rate = static_cast<float>((Uex(1) - Uex(0)) / dt);
+    ctrl_cmd.steering_tire_rotation_rate = static_cast<float>(calcDesiredSteeringRate(
+      mpc_matrix, x0, Uex, u_filtered, current_steer.steering_tire_angle, prediction_dt));
   }
 
   storeSteerCmd(u_filtered);
@@ -128,9 +132,9 @@ bool8_t MPC::calculateMPC(
   const float64_t steer_cmd = ctrl_cmd.steering_tire_angle;
   const float64_t wb = m_vehicle_model_ptr->getWheelbase();
 
-  typedef decltype(diagnostic.diag_array.data)::value_type DiagnosticValueType;
+  typedef decltype(diagnostic.data)::value_type DiagnosticValueType;
   auto append_diag_data = [&](const auto & val) -> void {
-    diagnostic.diag_array.data.push_back(static_cast<DiagnosticValueType>(val));
+    diagnostic.data.push_back(static_cast<DiagnosticValueType>(val));
   };
   // [0] final steering command (MPC + LPF)
   append_diag_data(steer_cmd);
@@ -145,9 +149,9 @@ bool8_t MPC::calculateMPC(
   // [5] lateral error
   append_diag_data(mpc_data.lateral_err);
   // [6] current_pose yaw
-  append_diag_data(to_angle(current_pose.orientation));
+  append_diag_data(tf2::getYaw(current_pose.orientation));
   // [7] nearest_pose yaw
-  append_diag_data(to_angle(mpc_data.nearest_pose.orientation));
+  append_diag_data(tf2::getYaw(mpc_data.nearest_pose.orientation));
   // [8] yaw error
   append_diag_data(mpc_data.yaw_err);
   // [9] reference velocity
@@ -176,8 +180,7 @@ void MPC::setReferenceTrajectory(
   const autoware_auto_planning_msgs::msg::Trajectory & trajectory_msg,
   const float64_t traj_resample_dist, const bool8_t enable_path_smoothing,
   const int64_t path_filter_moving_ave_num, const int64_t curvature_smoothing_num_traj,
-  const int64_t curvature_smoothing_num_ref_steer,
-  const geometry_msgs::msg::PoseStamped::SharedPtr current_pose_ptr)
+  const int64_t curvature_smoothing_num_ref_steer)
 {
   trajectory_follower::MPCTrajectory mpc_traj_raw;        // received raw trajectory
   trajectory_follower::MPCTrajectory mpc_traj_resampled;  // resampled trajectory
@@ -190,6 +193,11 @@ void MPC::setReferenceTrajectory(
     RCLCPP_WARN(m_logger, "[setReferenceTrajectory] spline error when resampling by distance");
     return;
   }
+
+  const auto is_forward_shift =
+    motion_utils::isDrivingForward(mpc_traj_resampled.toTrajectoryPoints());
+  // if driving direction is unknown, use previous value
+  m_is_forward_shift = is_forward_shift ? is_forward_shift.get() : m_is_forward_shift;
 
   /* path smoothing */
   mpc_traj_smoothed = mpc_traj_resampled;
@@ -210,14 +218,8 @@ void MPC::setReferenceTrajectory(
   }
 
   /* calculate yaw angle */
-  if (current_pose_ptr) {
-    const int64_t nearest_idx =
-      MPCUtils::calcNearestIndex(mpc_traj_smoothed, current_pose_ptr->pose);
-    const float64_t ego_yaw = tf2::getYaw(current_pose_ptr->pose.orientation);
-    trajectory_follower::MPCUtils::calcTrajectoryYawFromXY(
-      &mpc_traj_smoothed, nearest_idx, ego_yaw);
-    trajectory_follower::MPCUtils::convertEulerAngleToMonotonic(&mpc_traj_smoothed.yaw);
-  }
+  trajectory_follower::MPCUtils::calcTrajectoryYawFromXY(&mpc_traj_smoothed, m_is_forward_shift);
+  trajectory_follower::MPCUtils::convertEulerAngleToMonotonic(&mpc_traj_smoothed.yaw);
 
   /* calculate curvature */
   trajectory_follower::MPCUtils::calcTrajectoryCurvature(
@@ -227,8 +229,8 @@ void MPC::setReferenceTrajectory(
   /* add end point with vel=0 on traj for mpc prediction */
   {
     auto & t = mpc_traj_smoothed;
-    const float64_t t_ext = 100.0;  // extra time to prevent mpc calcul failure due to short time
-    const float64_t t_end = t.relative_time.back() + getPredictionTime() + t_ext;
+    const float64_t t_ext = 100.0;  // extra time to prevent mpc calc failure due to short time
+    const float64_t t_end = t.relative_time.back() + t_ext;
     const float64_t v_end = 0.0;
     t.vx.back() = v_end;  // set for end point
     t.push_back(
@@ -258,8 +260,8 @@ bool8_t MPC::getData(
   static constexpr auto duration = 5000 /*ms*/;
   size_t nearest_idx;
   if (!trajectory_follower::MPCUtils::calcNearestPoseInterp(
-        traj, current_pose, &(data->nearest_pose), &(nearest_idx), &(data->nearest_time), m_logger,
-        *m_clock)) {
+        traj, current_pose, &(data->nearest_pose), &(nearest_idx), &(data->nearest_time),
+        ego_nearest_dist_threshold, ego_nearest_yaw_threshold, m_logger, *m_clock)) {
     // reset previous MPC result
     // Note: When a large deviation from the trajectory occurs, the optimization stops and
     // the vehicle will return to the path by re-planning the trajectory or external operation.
@@ -277,7 +279,7 @@ bool8_t MPC::getData(
   data->lateral_err =
     trajectory_follower::MPCUtils::calcLateralError(current_pose, data->nearest_pose);
   data->yaw_err = autoware::common::helper_functions::wrap_angle(
-    to_angle(current_pose.orientation) - to_angle(data->nearest_pose.orientation));
+    tf2::getYaw(current_pose.orientation) - tf2::getYaw(data->nearest_pose.orientation));
 
   /* get predicted steer */
   if (!m_steer_prediction_prev) {
@@ -305,7 +307,9 @@ bool8_t MPC::getData(
   }
 
   /* check trajectory time length */
-  auto end_time = data->nearest_time + m_param.input_delay + getPredictionTime();
+  const float64_t max_prediction_time =
+    m_param.min_prediction_length / static_cast<float64_t>(m_param.prediction_horizon - 1);
+  auto end_time = data->nearest_time + m_param.input_delay + m_ctrl_period + max_prediction_time;
   if (end_time > traj.relative_time.back()) {
     RCLCPP_WARN_SKIPFIRST_THROTTLE(
       m_logger, *m_clock, 1000 /*ms*/, "path is too short for prediction.");
@@ -392,12 +396,13 @@ void MPC::storeSteerCmd(const float64_t steer)
 }
 
 bool8_t MPC::resampleMPCTrajectoryByTime(
-  float64_t ts, const trajectory_follower::MPCTrajectory & input,
+  const float64_t ts, const float64_t prediction_dt,
+  const trajectory_follower::MPCTrajectory & input,
   trajectory_follower::MPCTrajectory * output) const
 {
   std::vector<float64_t> mpc_time_v;
   for (float64_t i = 0; i < static_cast<float64_t>(m_param.prediction_horizon); ++i) {
-    mpc_time_v.push_back(ts + i * m_param.prediction_dt);
+    mpc_time_v.push_back(ts + i * prediction_dt);
   }
   if (!trajectory_follower::MPCUtils::linearInterpMPCTrajectory(
         input.relative_time, input, mpc_time_v, output)) {
@@ -481,10 +486,15 @@ trajectory_follower::MPCTrajectory MPC::applyVelocityDynamicsFilter(
   const trajectory_follower::MPCTrajectory & input, const geometry_msgs::msg::Pose & current_pose,
   const float64_t v0) const
 {
-  int64_t nearest_idx = trajectory_follower::MPCUtils::calcNearestIndex(input, current_pose);
-  if (nearest_idx < 0) {
+  autoware_auto_planning_msgs::msg::Trajectory autoware_traj;
+  autoware::motion::control::trajectory_follower::MPCUtils::convertToAutowareTrajectory(
+    input, autoware_traj);
+  if (autoware_traj.points.empty()) {
     return input;
   }
+
+  const size_t nearest_idx = motion_utils::findFirstNearestIndexWithSoftConstraints(
+    autoware_traj.points, current_pose, ego_nearest_dist_threshold, ego_nearest_yaw_threshold);
 
   const float64_t acc_lim = m_param.acceleration_limit;
   const float64_t tau = m_param.velocity_time_constant;
@@ -493,7 +503,7 @@ trajectory_follower::MPCTrajectory MPC::applyVelocityDynamicsFilter(
   trajectory_follower::MPCUtils::dynamicSmoothingVelocity(
     static_cast<size_t>(nearest_idx), v0, acc_lim, tau, output);
   const float64_t t_ext = 100.0;  // extra time to prevent mpc calculation failure due to short time
-  const float64_t t_end = output.relative_time.back() + getPredictionTime() + t_ext;
+  const float64_t t_end = output.relative_time.back() + t_ext;
   const float64_t v_end = 0.0;
   output.vx.back() = v_end;  // set for end point
   output.push_back(
@@ -507,12 +517,13 @@ trajectory_follower::MPCTrajectory MPC::applyVelocityDynamicsFilter(
  * cost function: J = Xex' * Qex * Xex + (Uex - Uref)' * R1ex * (Uex - Uref_ex) + Uex' * R2ex * Uex
  * Qex = diag([Q,Q,...]), R1ex = diag([R,R,...])
  */
-MPCMatrix MPC::generateMPCMatrix(const trajectory_follower::MPCTrajectory & reference_trajectory)
+MPCMatrix MPC::generateMPCMatrix(
+  const trajectory_follower::MPCTrajectory & reference_trajectory, const float64_t prediction_dt)
 {
   using Eigen::MatrixXd;
 
   const int64_t N = m_param.prediction_horizon;
-  const float64_t DT = m_param.prediction_dt;
+  const float64_t DT = prediction_dt;
   const int64_t DIM_X = m_vehicle_model_ptr->getDimX();
   const int64_t DIM_U = m_vehicle_model_ptr->getDimU();
   const int64_t DIM_Y = m_vehicle_model_ptr->getDimY();
@@ -539,17 +550,15 @@ MPCMatrix MPC::generateMPCMatrix(const trajectory_follower::MPCTrajectory & refe
   MatrixXd Cd(DIM_Y, DIM_X);
   MatrixXd Uref(DIM_U, 1);
 
-  constexpr float64_t ep = 1.0e-3;  // large enough to ignore velocity noise
+  const float64_t sign_vx = m_is_forward_shift ? 1 : -1;
 
   /* predict dynamics for N times */
   for (int64_t i = 0; i < N; ++i) {
     const float64_t ref_vx = reference_trajectory.vx[static_cast<size_t>(i)];
     const float64_t ref_vx_squared = ref_vx * ref_vx;
 
-    // curvature will be 0 when vehicle stops
-    const float64_t ref_k = reference_trajectory.k[static_cast<size_t>(i)] * m_sign_vx;
-    const float64_t ref_smooth_k =
-      reference_trajectory.smooth_k[static_cast<size_t>(i)] * m_sign_vx;
+    const float64_t ref_k = reference_trajectory.k[static_cast<size_t>(i)] * sign_vx;
+    const float64_t ref_smooth_k = reference_trajectory.smooth_k[static_cast<size_t>(i)] * sign_vx;
 
     /* get discrete state matrix A, B, C, W */
     m_vehicle_model_ptr->setVelocity(ref_vx);
@@ -606,14 +615,13 @@ MPCMatrix MPC::generateMPCMatrix(const trajectory_follower::MPCTrajectory & refe
   /* add lateral jerk : weight for (v * {u(i) - u(i-1)} )^2 */
   for (int64_t i = 0; i < N - 1; ++i) {
     const float64_t ref_vx = reference_trajectory.vx[static_cast<size_t>(i)];
-    m_sign_vx = ref_vx > ep ? 1 : (ref_vx < -ep ? -1 : m_sign_vx);
-    const float64_t ref_k = reference_trajectory.k[static_cast<size_t>(i)] * m_sign_vx;
+    const float64_t ref_k = reference_trajectory.k[static_cast<size_t>(i)] * sign_vx;
     const float64_t j = ref_vx * ref_vx * getWeightLatJerk(ref_k) / (DT * DT);
     const Eigen::Matrix2d J = (Eigen::Matrix2d() << j, -j, -j, j).finished();
     m.R2ex.block(i, i, 2, 2) += J;
   }
 
-  addSteerWeightR(&m.R1ex);
+  addSteerWeightR(prediction_dt, &m.R1ex);
 
   return m;
 }
@@ -641,7 +649,8 @@ MPCMatrix MPC::generateMPCMatrix(const trajectory_follower::MPCTrajectory & refe
  * [    -au_lim * dt    ] < [uN-uN-1] < [     au_lim * dt    ] (*N... DIM_U)
  */
 bool8_t MPC::executeOptimization(
-  const MPCMatrix & m, const Eigen::VectorXd & x0, Eigen::VectorXd * Uex)
+  const MPCMatrix & m, const Eigen::VectorXd & x0, const float64_t prediction_dt,
+  Eigen::VectorXd * Uex)
 {
   using Eigen::MatrixXd;
   using Eigen::VectorXd;
@@ -664,7 +673,7 @@ bool8_t MPC::executeOptimization(
   H.triangularView<Eigen::Upper>() += m.R1ex + m.R2ex;
   H.triangularView<Eigen::Lower>() = H.transpose();
   MatrixXd f = (m.Cex * (m.Aex * x0 + m.Wex)).transpose() * QCB - m.Uref_ex.transpose() * m.R1ex;
-  addSteerWeightF(&f);
+  addSteerWeightF(prediction_dt, &f);
 
   MatrixXd A = MatrixXd::Identity(DIM_U_N, DIM_U_N);
   for (int64_t i = 1; i < DIM_U_N; i++) {
@@ -673,8 +682,8 @@ bool8_t MPC::executeOptimization(
 
   VectorXd lb = VectorXd::Constant(DIM_U_N, -m_steer_lim);  // min steering angle
   VectorXd ub = VectorXd::Constant(DIM_U_N, m_steer_lim);   // max steering angle
-  VectorXd lbA = VectorXd::Constant(DIM_U_N, -m_steer_rate_lim * m_param.prediction_dt);
-  VectorXd ubA = VectorXd::Constant(DIM_U_N, m_steer_rate_lim * m_param.prediction_dt);
+  VectorXd lbA = VectorXd::Constant(DIM_U_N, -m_steer_rate_lim * prediction_dt);
+  VectorXd ubA = VectorXd::Constant(DIM_U_N, m_steer_rate_lim * prediction_dt);
   lbA(0, 0) = m_raw_steer_cmd_prev - m_steer_rate_lim * m_ctrl_period;
   ubA(0, 0) = m_raw_steer_cmd_prev + m_steer_rate_lim * m_ctrl_period;
 
@@ -699,10 +708,10 @@ bool8_t MPC::executeOptimization(
   return true;
 }
 
-void MPC::addSteerWeightR(Eigen::MatrixXd * R_ptr) const
+void MPC::addSteerWeightR(const float64_t prediction_dt, Eigen::MatrixXd * R_ptr) const
 {
   const int64_t N = m_param.prediction_horizon;
-  const float64_t DT = m_param.prediction_dt;
+  const float64_t DT = prediction_dt;
 
   auto & R = *R_ptr;
 
@@ -744,13 +753,13 @@ void MPC::addSteerWeightR(Eigen::MatrixXd * R_ptr) const
   }
 }
 
-void MPC::addSteerWeightF(Eigen::MatrixXd * f_ptr) const
+void MPC::addSteerWeightF(const float64_t prediction_dt, Eigen::MatrixXd * f_ptr) const
 {
   if (f_ptr->rows() < 2) {
     return;
   }
 
-  const float64_t DT = m_param.prediction_dt;
+  const float64_t DT = prediction_dt;
   auto & f = *f_ptr;
 
   // steer rate for i = 0
@@ -770,10 +779,65 @@ void MPC::addSteerWeightF(Eigen::MatrixXd * f_ptr) const
   f(0, 1) += (2.0 * m_raw_steer_cmd_prev * steer_acc_r_cp1) * 0.5;
 }
 
-float64_t MPC::getPredictionTime() const
+float64_t MPC::getPredictionDeltaTime(
+  const float64_t start_time, const trajectory_follower::MPCTrajectory & input,
+  const geometry_msgs::msg::Pose & current_pose) const
 {
-  return static_cast<float64_t>(m_param.prediction_horizon - 1) * m_param.prediction_dt +
-         m_param.input_delay + m_ctrl_period;
+  // Calculate the time min_prediction_length ahead from current_pose
+  autoware_auto_planning_msgs::msg::Trajectory autoware_traj;
+  autoware::motion::control::trajectory_follower::MPCUtils::convertToAutowareTrajectory(
+    input, autoware_traj);
+  const size_t nearest_idx = motion_utils::findFirstNearestIndexWithSoftConstraints(
+    autoware_traj.points, current_pose, ego_nearest_dist_threshold, ego_nearest_yaw_threshold);
+  float64_t sum_dist = 0;
+  const float64_t target_time = [&]() {
+    const float64_t t_ext =
+      100.0;  // extra time to prevent mpc calculation failure due to short time
+    for (size_t i = nearest_idx + 1; i < input.relative_time.size(); i++) {
+      const float64_t segment_dist =
+        std::hypot(input.x.at(i) - input.x.at(i - 1), input.y.at(i) - input.y.at(i - 1));
+      sum_dist += segment_dist;
+      if (m_param.min_prediction_length < sum_dist) {
+        const float64_t prev_sum_dist = sum_dist - segment_dist;
+        const float64_t ratio = (m_param.min_prediction_length - prev_sum_dist) / segment_dist;
+        const float64_t relative_time_at_i = i == input.relative_time.size() - 1
+                                               ? input.relative_time.at(i) - t_ext
+                                               : input.relative_time.at(i);
+        return input.relative_time.at(i - 1) +
+               (relative_time_at_i - input.relative_time.at(i - 1)) * ratio;
+      }
+    }
+    return input.relative_time.back() - t_ext;
+  }();
+
+  // Calculate delta time for min_prediction_length
+  const float64_t dt =
+    (target_time - start_time) / static_cast<float64_t>(m_param.prediction_horizon - 1);
+
+  return std::max(dt, m_param.prediction_dt);
+}
+
+float64_t MPC::calcDesiredSteeringRate(
+  const MPCMatrix & mpc_matrix, const Eigen::MatrixXd & x0, const Eigen::MatrixXd & Uex,
+  const float64_t u_filtered, const float current_steer, const float64_t predict_dt) const
+{
+  if (m_vehicle_model_type != "kinematics") {
+    // not supported yet. Use old implementation.
+    return (u_filtered - current_steer) / predict_dt;
+  }
+
+  // calculate predicted states to get the steering motion
+  const auto & m = mpc_matrix;
+  const Eigen::MatrixXd Xex = m.Aex * x0 + m.Bex * Uex + m.Wex;
+
+  const size_t STEER_IDX = 2;  // for kinematics model
+
+  const auto steer_0 = x0(STEER_IDX, 0);
+  const auto steer_1 = Xex(STEER_IDX, 0);
+
+  const auto steer_rate = (steer_1 - steer_0) / predict_dt;
+
+  return steer_rate;
 }
 
 bool8_t MPC::isValid(const MPCMatrix & m) const

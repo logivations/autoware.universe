@@ -19,6 +19,7 @@
 #include "motion_common/motion_common.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
 #include "simple_planning_simulator/vehicle_model/sim_model.hpp"
+#include "tier4_autoware_utils/ros/msg_covariance.hpp"
 #include "tier4_autoware_utils/ros/update_param.hpp"
 #include "vehicle_info_util/vehicle_info_util.hpp"
 
@@ -86,7 +87,7 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
   using std::placeholders::_2;
 
   sub_init_pose_ = create_subscription<PoseWithCovarianceStamped>(
-    "/initialpose", QoS{1}, std::bind(&SimplePlanningSimulator::on_initialpose, this, _1));
+    "input/initialpose", QoS{1}, std::bind(&SimplePlanningSimulator::on_initialpose, this, _1));
   sub_ackermann_cmd_ = create_subscription<AckermannControlCommand>(
     "input/ackermann_control_command", QoS{1},
     [this](const AckermannControlCommand::SharedPtr msg) { current_ackermann_cmd_ = *msg; });
@@ -108,7 +109,7 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
   sub_trajectory_ = create_subscription<Trajectory>(
     "input/trajectory", QoS{1}, std::bind(&SimplePlanningSimulator::on_trajectory, this, _1));
 
-  srv_mode_req_ = create_service<tier4_vehicle_msgs::srv::ControlModeRequest>(
+  srv_mode_req_ = create_service<ControlModeCommand>(
     "input/control_mode_request",
     std::bind(&SimplePlanningSimulator::on_control_mode_request, this, _1, _2));
 
@@ -127,6 +128,7 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
   pub_velocity_ = create_publisher<VelocityReport>("output/twist", QoS{1});
   pub_odom_ = create_publisher<Odometry>("output/odometry", QoS{1});
   pub_steer_ = create_publisher<SteeringReport>("output/steering", QoS{1});
+  pub_acc_ = create_publisher<AccelWithCovarianceStamped>("output/acceleration", QoS{1});
   pub_tf_ = create_publisher<tf2_msgs::msg::TFMessage>("/tf", QoS{1});
 
   /* set param callback */
@@ -134,8 +136,8 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
     std::bind(&SimplePlanningSimulator::on_parameter, this, _1));
 
   timer_sampling_time_ms_ = static_cast<uint32_t>(declare_parameter("timer_sampling_time_ms", 25));
-  on_timer_ = create_wall_timer(
-    std::chrono::milliseconds(timer_sampling_time_ms_),
+  on_timer_ = rclcpp::create_timer(
+    this, get_clock(), std::chrono::milliseconds(timer_sampling_time_ms_),
     std::bind(&SimplePlanningSimulator::on_timer, this));
 
   tier4_api_utils::ServiceProxyNodeInterface proxy(this);
@@ -177,7 +179,7 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
   }
 
   // control mode
-  current_control_mode_.data = ControlMode::AUTO;
+  current_control_mode_.mode = ControlModeReport::AUTONOMOUS;
   current_manual_gear_cmd_.command = GearCommand::DRIVE;
 }
 
@@ -258,7 +260,7 @@ void SimplePlanningSimulator::on_timer()
   {
     const float64_t dt = delta_time_.get_dt(get_clock()->now());
 
-    if (current_control_mode_.data == ControlMode::AUTO) {
+    if (current_control_mode_.mode == ControlModeReport::AUTONOMOUS) {
       vehicle_model_ptr_->setGear(current_gear_cmd_.command);
       set_input(current_ackermann_cmd_);
     } else {
@@ -285,14 +287,16 @@ void SimplePlanningSimulator::on_timer()
 
   // add estimate covariance
   {
-    current_odometry_.pose.covariance[0 * 6 + 0] = x_stddev_;
-    current_odometry_.pose.covariance[1 * 6 + 1] = y_stddev_;
+    using COV_IDX = tier4_autoware_utils::xyzrpy_covariance_index::XYZRPY_COV_IDX;
+    current_odometry_.pose.covariance[COV_IDX::X_X] = x_stddev_;
+    current_odometry_.pose.covariance[COV_IDX::Y_Y] = y_stddev_;
   }
 
   // publish vehicle state
   publish_odometry(current_odometry_);
   publish_velocity(current_velocity_);
   publish_steering(current_steer_);
+  publish_acceleration();
 
   publish_control_mode_report();
   publish_gear_report();
@@ -381,11 +385,20 @@ void SimplePlanningSimulator::on_engage(const Engage::ConstSharedPtr msg)
 }
 
 void SimplePlanningSimulator::on_control_mode_request(
-  const ControlModeRequest::Request::SharedPtr request,
-  const ControlModeRequest::Response::SharedPtr response)
+  const ControlModeCommand::Request::SharedPtr request,
+  const ControlModeCommand::Response::SharedPtr response)
 {
-  current_control_mode_ = request->mode;
-  response->success = true;
+  const auto m = request->mode;
+  if (m == ControlModeCommand::Request::MANUAL) {
+    current_control_mode_.mode = ControlModeReport::MANUAL;
+    response->success = true;
+  } else if (m == ControlModeCommand::Request::AUTONOMOUS) {
+    current_control_mode_.mode = ControlModeReport::AUTONOMOUS;
+    response->success = true;
+  } else {  // not supported
+    response->success = false;
+    RCLCPP_ERROR(this->get_logger(), "Requested mode not supported");
+  }
   return;
 }
 
@@ -518,16 +531,28 @@ void SimplePlanningSimulator::publish_steering(const SteeringReport & steer)
   pub_steer_->publish(msg);
 }
 
+void SimplePlanningSimulator::publish_acceleration()
+{
+  AccelWithCovarianceStamped msg;
+  msg.header.frame_id = "/base_link";
+  msg.header.stamp = get_clock()->now();
+  msg.accel.accel.linear.x = vehicle_model_ptr_->getAx();
+
+  using COV_IDX = tier4_autoware_utils::xyzrpy_covariance_index::XYZRPY_COV_IDX;
+  constexpr auto COV = 0.001;
+  msg.accel.covariance.at(COV_IDX::X_X) = COV;          // linear x
+  msg.accel.covariance.at(COV_IDX::Y_Y) = COV;          // linear y
+  msg.accel.covariance.at(COV_IDX::Z_Z) = COV;          // linear z
+  msg.accel.covariance.at(COV_IDX::ROLL_ROLL) = COV;    // angular x
+  msg.accel.covariance.at(COV_IDX::PITCH_PITCH) = COV;  // angular y
+  msg.accel.covariance.at(COV_IDX::YAW_YAW) = COV;      // angular z
+  pub_acc_->publish(msg);
+}
+
 void SimplePlanningSimulator::publish_control_mode_report()
 {
-  ControlModeReport msg;
-  msg.stamp = get_clock()->now();
-  if (current_control_mode_.data == ControlMode::AUTO) {
-    msg.mode = ControlModeReport::AUTONOMOUS;
-  } else {
-    msg.mode = ControlModeReport::MANUAL;
-  }
-  pub_control_mode_report_->publish(msg);
+  current_control_mode_.stamp = get_clock()->now();
+  pub_control_mode_report_->publish(current_control_mode_);
 }
 
 void SimplePlanningSimulator::publish_gear_report()

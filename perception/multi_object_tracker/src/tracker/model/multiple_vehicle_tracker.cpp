@@ -42,7 +42,7 @@ bool MultipleVehicleTracker::measure(
 {
   big_vehicle_tracker_.measure(object, time);
   normal_vehicle_tracker_.measure(object, time);
-  if (utils::getHighestProbLabel(object.classification) != Label::UNKNOWN)
+  if (perception_utils::getHighestProbLabel(object.classification) != Label::UNKNOWN)
     setClassification(object.classification);
   return true;
 }
@@ -55,7 +55,7 @@ bool MultipleVehicleTracker::getTrackedObject(
 
   if (label == Label::CAR) {
     normal_vehicle_tracker_.getTrackedObject(time, object);
-  } else if (label == Label::BUS || label == Label::TRUCK) {
+  } else if (utils::isLargeVehicleLabel(label)) {
     big_vehicle_tracker_.getTrackedObject(time, object);
   }
   object.object_id = getUUID();

@@ -23,14 +23,17 @@
 
 using Label = autoware_auto_perception_msgs::msg::ObjectClassification;
 
-ShapeEstimator::ShapeEstimator(bool use_corrector, bool use_filter)
-: use_corrector_(use_corrector), use_filter_(use_filter)
+ShapeEstimator::ShapeEstimator(bool use_corrector, bool use_filter, bool use_boost_bbox_optimizer)
+: use_corrector_(use_corrector),
+  use_filter_(use_filter),
+  use_boost_bbox_optimizer_(use_boost_bbox_optimizer)
 {
 }
 
 bool ShapeEstimator::estimateShapeAndPose(
   const uint8_t label, const pcl::PointCloud<pcl::PointXYZ> & cluster,
   const boost::optional<ReferenceYawInfo> & ref_yaw_info,
+  const boost::optional<ReferenceShapeSizeInfo> & ref_shape_size_info,
   autoware_auto_perception_msgs::msg::Shape & shape_output, geometry_msgs::msg::Pose & pose_output)
 {
   autoware_auto_perception_msgs::msg::Shape shape;
@@ -50,7 +53,7 @@ bool ShapeEstimator::estimateShapeAndPose(
   // rule based corrector
   if (use_corrector_) {
     bool use_reference_yaw = ref_yaw_info ? true : false;
-    if (!applyCorrector(label, use_reference_yaw, shape, pose)) {
+    if (!applyCorrector(label, use_reference_yaw, ref_shape_size_info, shape, pose)) {
       return false;
     }
   }
@@ -69,14 +72,10 @@ bool ShapeEstimator::estimateOriginalShapeAndPose(
   std::unique_ptr<ShapeEstimationModelInterface> model_ptr;
   if (
     label == Label::CAR || label == Label::TRUCK || label == Label::BUS ||
-    label == Label::TRAILER) {
-    model_ptr.reset(new BoundingBoxShapeModel(ref_yaw_info));
+    label == Label::TRAILER || label == Label::MOTORCYCLE || label == Label::BICYCLE) {
+    model_ptr.reset(new BoundingBoxShapeModel(ref_yaw_info, use_boost_bbox_optimizer_));
   } else if (label == Label::PEDESTRIAN) {
     model_ptr.reset(new CylinderShapeModel());
-  } else if (label == Label::MOTORCYCLE) {
-    model_ptr.reset(new BoundingBoxShapeModel(ref_yaw_info));
-  } else if (label == Label::BICYCLE) {
-    model_ptr.reset(new BoundingBoxShapeModel(ref_yaw_info));
   } else {
     model_ptr.reset(new ConvexHullShapeModel());
   }
@@ -104,10 +103,14 @@ bool ShapeEstimator::applyFilter(
 
 bool ShapeEstimator::applyCorrector(
   const uint8_t label, const bool use_reference_yaw,
+  const boost::optional<ReferenceShapeSizeInfo> & ref_shape_size_info,
   autoware_auto_perception_msgs::msg::Shape & shape, geometry_msgs::msg::Pose & pose)
 {
   std::unique_ptr<ShapeEstimationCorrectorInterface> corrector_ptr;
-  if (label == Label::CAR) {
+
+  if (ref_shape_size_info && use_reference_yaw) {
+    corrector_ptr.reset(new ReferenceShapeBasedVehicleCorrector(ref_shape_size_info.get()));
+  } else if (label == Label::CAR) {
     corrector_ptr.reset(new CarCorrector(use_reference_yaw));
   } else if (label == Label::BUS) {
     corrector_ptr.reset(new BusCorrector(use_reference_yaw));
