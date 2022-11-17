@@ -800,7 +800,7 @@ void HddMonitor::updateHddConnections()
     if (!hdd_param.second.part_device_.empty()) {
       // Check the existence of device file
       std::error_code ec;
-      if (std::filesystem::exists(hdd_param.second.part_device_, ec)) {
+      if (std::experimental::filesystem::exists(hdd_param.second.part_device_, ec)) {
         hdd_connected_flags_[hdd_param.first] = true;
 
         // Remove index number of partition for passing device name to hdd-reader
